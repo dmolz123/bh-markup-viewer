@@ -97,12 +97,15 @@ function fail(res, r, where) {
 // detail DTO (SessionMarkupDetailDto) carries rect/contents but NO markupId and
 // NO pageNumber — its stable key is `name` (the markup GUID). So join on `name`.
 function mergeMarkups(list, details) {
+  list = Array.isArray(list) ? list : [];
+  details = Array.isArray(details) ? details : [];
   const detByName = new Map();
-  (Array.isArray(details) ? details : []).forEach((d) => {
-    if (d && d.name != null) detByName.set(String(d.name), d);
-  });
-  const out = (Array.isArray(list) ? list : []).map((m) => {
-    const d = m.name != null ? detByName.get(String(m.name)) : null;
+  details.forEach((d) => { if (d && d.name != null) detByName.set(String(d.name), d); });
+  const samePositional = details.length === list.length; // fallback when names don't line up
+  const out = list.map((m, i) => {
+    let d = m.name != null ? detByName.get(String(m.name)) : null;
+    if (!d && samePositional) d = details[i];
+    const rect = d && Array.isArray(d.rect) && d.rect.length === 4 ? d.rect : null;
     return {
       markupId: m.markupId,
       name: m.name,
@@ -112,7 +115,7 @@ function mergeMarkups(list, details) {
       type: m.type || (d && d.type) || '',
       author: m.displayName || m.email || (d && d.author) || '',
       contents: (d && d.contents) || m.comments || '',
-      rect: d && Array.isArray(d.rect) && d.rect.length === 4 ? d.rect : null,
+      rect,
     };
   });
   return out.sort((a, b) => {
@@ -218,6 +221,29 @@ function consumeState(s) {
   pendingStates.delete(s);
   return Date.now() < exp;
 }
+
+// Raw inspection of what Studio returns for a Session (for debugging field shapes).
+app.get('/api/raw/:sid', async (req, res) => {
+  const sid = req.params.sid;
+  const files = await bb('/publicapi/v1/sessions/' + encodeURIComponent(sid) + '/files');
+  if (!files.ok) return fail(res, files, 'GET files');
+  const list = filesArray(files.json);
+  const file = pickPdf(list);
+  const fid = file && (file.Id != null ? file.Id : file.id);
+  if (!fid) return res.json({ fileId: null, files: list });
+  const [mk, det] = await Promise.all([
+    bb('/publicapi/v2/sessions/' + encodeURIComponent(sid) + '/files/' + encodeURIComponent(fid) + '/markups'),
+    bb('/publicapi/v2/sessions/' + encodeURIComponent(sid) + '/files/' + encodeURIComponent(fid) + '/markups/details?limit=1000'),
+  ]);
+  const arr = (x) => (Array.isArray(x) ? x : []);
+  res.json({
+    fileId: fid,
+    markupsCount: Array.isArray(mk.json) ? mk.json.length : mk.json,
+    detailsCount: Array.isArray(det.json) ? det.json.length : det.json,
+    markupsSample: arr(mk.json).map((m) => ({ markupId: m.markupId, name: m.name, page: m.pageNumber, subject: m.subject, status: m.status })),
+    detailsSample: arr(det.json).map((d) => ({ name: d.name, page: d.pageNumber, subject: d.subject, hasRect: Array.isArray(d.rect), rect: d.rect })),
+  });
+});
 
 // One-time authorization: send the admin to Studio to grant access.
 app.get('/auth/login', (req, res) => {
