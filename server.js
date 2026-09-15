@@ -44,19 +44,21 @@ function redirectUri(req) {
 async function bb(pathPart, opts = {}, _retried) {
   let token;
   try { token = await tokens.getAccessToken(); } catch (e) {
-    return { ok: false, status: 401, json: { error: 'Could not obtain a Studio token: ' + e.message, detail: e.detail } };
+    return { ok: false, status: 401, json: { error: 'Could not obtain a Studio token: ' + e.message, tokenError: e.detail || { error: e.message } } };
   }
   if (!token) {
     return { ok: false, status: 500, json: { error: 'No Studio credentials configured. Set BLUEBEAM_CLIENT_ID/BLUEBEAM_CLIENT_SECRET + a refresh token (or connect via /auth/login), or set BLUEBEAM_TOKEN.' } };
   }
-  const res = await fetch(API_BASE + pathPart, {
-    ...opts,
-    headers: {
-      Authorization: 'Bearer ' + token,
-      Accept: 'application/json',
-      ...(opts.headers || {}),
-    },
-  });
+  const headers = {
+    Authorization: 'Bearer ' + token,
+    Accept: 'application/json',
+    ...(opts.headers || {}),
+  };
+  // Bluebeam's security also defines a `client_id` header apiKey. Many Studio
+  // endpoints require it alongside the Bearer token, so send it when we have it.
+  if (tokens.config.CLIENT_ID) headers['client_id'] = tokens.config.CLIENT_ID;
+
+  const res = await fetch(API_BASE + pathPart, { ...opts, headers });
   if (res.status === 401 && !_retried && tokens.haveOAuth()) {
     try { await tokens.getAccessToken(true); } catch { /* fall through to report 401 */ }
     return bb(pathPart, opts, true);
@@ -67,12 +69,27 @@ async function bb(pathPart, opts = {}, _retried) {
   return { ok: res.ok, status: res.status, json };
 }
 
-// Bubble a Studio failure to the client with a useful message (esp. 401 = token expired).
+// Bubble a Studio failure to the client with a specific, diagnostic message.
 function fail(res, r, where) {
-  const hint = r.status === 401
-    ? 'Studio returned 401 — the Bearer token is missing, invalid, or expired. Refresh BLUEBEAM_TOKEN in the environment.'
-    : ('Studio API error at ' + where + '.');
-  res.status(r.status && r.status >= 400 ? r.status : 502).json({ error: hint, status: r.status, detail: r.json });
+  let hint;
+  if (r.json && r.json.tokenError) {
+    // The token endpoint itself rejected us (refresh/exchange failed).
+    const te = r.json.tokenError;
+    const detail = (te && (te.error_description || te.error)) ||
+      (te && te.errorDetails && te.errorDetails.message) || 'see detail';
+    hint = 'OAuth token request failed (' + detail + '). Check BLUEBEAM_CLIENT_ID / BLUEBEAM_CLIENT_SECRET and that the refresh token is valid for this client.';
+  } else if (r.status === 401) {
+    hint = tokens.haveOAuth()
+      ? 'Studio returned 401 on the API call even with a refreshed access token. Likely a client_id header / scope / permissions mismatch for this Session.'
+      : 'Studio returned 401 — no valid access token. You are in static-token mode: put your refresh token in BLUEBEAM_REFRESH_TOKEN (with client id/secret), or paste a current access token in BLUEBEAM_TOKEN.';
+  } else if (r.status === 403) {
+    hint = 'Studio returned 403 — the account is authenticated but not permitted on this Session (not a member, or insufficient permission).';
+  } else if (r.status === 404) {
+    hint = 'Studio returned 404 — Session or file not found. Check the Session ID.';
+  } else {
+    hint = 'Studio API error at ' + where + ' (HTTP ' + r.status + ').';
+  }
+  res.status(r.status && r.status >= 400 ? r.status : 502).json({ error: hint, status: r.status, where, detail: r.json });
 }
 
 // ---- merge markups (list) + details (rect) by markupId ---------------------
@@ -158,6 +175,40 @@ function pickPdf(files) {
 app.get('/api/health', (req, res) => {
   const auth = tokens.status();
   res.json({ ok: true, apiBase: API_BASE, auth, ready: auth.ready, tokenPresent: auth.ready });
+});
+
+// Diagnostics: walks the auth chain and reports where it breaks, WITHOUT leaking
+// tokens. Visit /api/diag on the deployed service to see the real failure.
+app.get('/api/diag', async (req, res) => {
+  const out = { apiBase: API_BASE, auth: tokens.status(), steps: {} };
+
+  // Step 1: can we get an access token at all?
+  let token = '';
+  try {
+    token = await tokens.getAccessToken(true); // force a fresh refresh/exchange
+    out.steps.tokenRequest = token
+      ? { ok: true, note: 'Obtained an access token (' + tokens.status().mode + ').' }
+      : { ok: false, note: 'No credentials configured.' };
+  } catch (e) {
+    out.steps.tokenRequest = { ok: false, error: e.message, detail: e.detail || null };
+    return res.json(out); // can't test API without a token
+  }
+  if (!token) return res.json(out);
+
+  // Step 2: an authenticated call that doesn't depend on a Session ID.
+  const headers = { Authorization: 'Bearer ' + token, Accept: 'application/json' };
+  const withCid = tokens.config.CLIENT_ID ? { ...headers, client_id: tokens.config.CLIENT_ID } : headers;
+  async function probe(hdrs) {
+    try {
+      const r = await fetch(API_BASE + '/publicapi/v1/sessions', { headers: hdrs });
+      const t = await r.text();
+      let j = null; try { j = t ? JSON.parse(t) : null; } catch { j = (t || '').slice(0, 300); }
+      return { status: r.status, ok: r.ok, sample: Array.isArray(j) ? ('array[' + j.length + ']') : j };
+    } catch (e) { return { error: e.message }; }
+  }
+  out.steps.listSessions_withClientIdHeader = await probe(withCid);
+  out.steps.listSessions_bearerOnly = await probe(headers);
+  res.json(out);
 });
 
 // One-time authorization: send the admin to Studio to grant access.
