@@ -23,28 +23,44 @@
 
 const express = require('express');
 const path = require('path');
+const tokens = require('./token');
 
 const app = express();
 const API_BASE = (process.env.BLUEBEAM_API_BASE || 'https://api.bluebeam.com').replace(/\/+$/, '');
-const TOKEN = process.env.BLUEBEAM_TOKEN || '';
+const APP_BASE_URL = (process.env.APP_BASE_URL || '').replace(/\/+$/, ''); // optional exact redirect base
 const PORT = process.env.PORT || 3000;
 
+app.set('trust proxy', true); // so req.protocol is https behind Render's proxy
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
+function redirectUri(req) {
+  return (APP_BASE_URL || (req.protocol + '://' + req.get('host'))) + '/auth/callback';
+}
+
 // ---- Studio API helper -----------------------------------------------------
-async function bb(pathPart, opts = {}) {
-  if (!TOKEN) {
-    return { ok: false, status: 500, json: { error: 'BLUEBEAM_TOKEN is not set on the server.' } };
+// Uses the token manager (OAuth refresh or static token) and retries once on a
+// 401 after forcing a token refresh.
+async function bb(pathPart, opts = {}, _retried) {
+  let token;
+  try { token = await tokens.getAccessToken(); } catch (e) {
+    return { ok: false, status: 401, json: { error: 'Could not obtain a Studio token: ' + e.message, detail: e.detail } };
+  }
+  if (!token) {
+    return { ok: false, status: 500, json: { error: 'No Studio credentials configured. Set BLUEBEAM_CLIENT_ID/BLUEBEAM_CLIENT_SECRET + a refresh token (or connect via /auth/login), or set BLUEBEAM_TOKEN.' } };
   }
   const res = await fetch(API_BASE + pathPart, {
     ...opts,
     headers: {
-      Authorization: 'Bearer ' + TOKEN,
+      Authorization: 'Bearer ' + token,
       Accept: 'application/json',
       ...(opts.headers || {}),
     },
   });
+  if (res.status === 401 && !_retried && tokens.haveOAuth()) {
+    try { await tokens.getAccessToken(true); } catch { /* fall through to report 401 */ }
+    return bb(pathPart, opts, true);
+  }
   const text = await res.text();
   let json = null;
   if (text) { try { json = JSON.parse(text); } catch { json = text; } }
@@ -140,7 +156,40 @@ function pickPdf(files) {
 
 // ---- routes ----------------------------------------------------------------
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, tokenPresent: !!TOKEN, apiBase: API_BASE });
+  const auth = tokens.status();
+  res.json({ ok: true, apiBase: API_BASE, auth, ready: auth.ready, tokenPresent: auth.ready });
+});
+
+// One-time authorization: send the admin to Studio to grant access.
+app.get('/auth/login', (req, res) => {
+  if (!tokens.config.CLIENT_ID || !tokens.config.CLIENT_SECRET) {
+    return res.status(400).send('Set BLUEBEAM_CLIENT_ID and BLUEBEAM_CLIENT_SECRET before using /auth/login.');
+  }
+  res.redirect(tokens.authorizeUrl(redirectUri(req)));
+});
+
+// Studio redirects back here with ?code=... — exchange it for tokens (incl. the
+// long-lived refresh token, which is then cached + persisted).
+app.get('/auth/callback', async (req, res) => {
+  const code = req.query.code;
+  if (!code) {
+    const err = req.query.error_description || req.query.error || 'no code returned';
+    return res.status(400).send('Authorization failed: ' + err);
+  }
+  try {
+    await tokens.exchangeCode(String(code), redirectUri(req));
+    const s = tokens.status();
+    res.set('Content-Type', 'text/html').send(
+      '<!doctype html><meta charset=utf-8><title>Connected</title>' +
+      '<body style="font:15px system-ui;max-width:640px;margin:60px auto;color:#12202E">' +
+      '<h2 style="color:#1F8A54">Connected to Bluebeam Studio</h2>' +
+      '<p>The server now holds a refresh token and will keep access tokens fresh automatically.</p>' +
+      '<p style="color:#5E6C7A">Mode: <code>' + s.mode + '</code> · access token valid ~' + (s.expiresInSeconds || '?') + 's.</p>' +
+      '<p><a href="/">Open the viewer &rarr;</a></p></body>'
+    );
+  } catch (e) {
+    res.status(502).send('Token exchange failed: ' + e.message + (e.detail ? ' — ' + JSON.stringify(e.detail) : ''));
+  }
 });
 
 app.get('/api/sessions/:sid', async (req, res) => {
@@ -210,11 +259,12 @@ app.get('/api/image', async (req, res) => {
   }
 });
 
-// SPA-ish fallback: send the viewer for any non-API GET.
-app.get(/^\/(?!api\/).*/, (req, res) => {
+// SPA-ish fallback: send the viewer for any non-API, non-auth GET.
+app.get(/^\/(?!api\/|auth\/).*/, (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 app.listen(PORT, () => {
-  console.log('BH Markup Viewer on :' + PORT + '  (token ' + (TOKEN ? 'present' : 'MISSING') + ', api ' + API_BASE + ')');
+  const s = tokens.status();
+  console.log('BH Markup Viewer on :' + PORT + '  (auth mode: ' + s.mode + ', api ' + API_BASE + ')');
 });

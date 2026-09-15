@@ -8,7 +8,16 @@ services:
     buildCommand: npm install
     startCommand: npm start
     envVars:
+      # OAuth auto-refresh mode (recommended). Set the real secret values in the
+      # Render dashboard; then visit /auth/login once (or set BLUEBEAM_REFRESH_TOKEN).
+      - key: BLUEBEAM_CLIENT_ID
+        sync: false
+      - key: BLUEBEAM_CLIENT_SECRET
+        sync: false
+      - key: BLUEBEAM_REFRESH_TOKEN
+        sync: false
+      # Fallback: paste a short-lived access token instead of OAuth.
       - key: BLUEBEAM_TOKEN
-        sync: false          # set the real value in the Render dashboard
+        sync: false
       - key: BLUEBEAM_API_BASE
         value: https://api.bluebeam.com

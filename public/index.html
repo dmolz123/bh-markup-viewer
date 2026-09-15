@@ -363,7 +363,15 @@
 
   // token sanity check + deep-link
   fetch('/api/health').then(function(r){return r.json();}).then(function(h){
-    if(h && !h.tokenPresent){ banner('err','Server has no <code>BLUEBEAM_TOKEN</code> set. Add it in the Render environment and redeploy.'); }
+    if(!h) return;
+    var a=h.auth||{};
+    if(!h.ready){
+      if(a.hasClientCreds && !a.hasRefreshToken){
+        banner('info','Not connected to Studio yet. <a href="/auth/login">Connect with Bluebeam</a> once, and the server will keep tokens fresh automatically.');
+      }else{
+        banner('err','No Studio credentials on the server. Set <code>BLUEBEAM_CLIENT_ID</code>, <code>BLUEBEAM_CLIENT_SECRET</code> and a refresh token (or <code>BLUEBEAM_TOKEN</code>) in the Render environment.');
+      }
+    }
   }).catch(function(){});
   initFromHash();
 </script>
