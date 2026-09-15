@@ -211,21 +211,39 @@ app.get('/api/diag', async (req, res) => {
   res.json(out);
 });
 
+// CSRF state values pending between /auth/login and /auth/callback.
+const pendingStates = new Map(); // state -> expiresAt
+function newState() {
+  const s = require('crypto').randomBytes(16).toString('hex');
+  pendingStates.set(s, Date.now() + 10 * 60 * 1000);
+  return s;
+}
+function consumeState(s) {
+  const exp = pendingStates.get(s);
+  if (!exp) return false;
+  pendingStates.delete(s);
+  return Date.now() < exp;
+}
+
 // One-time authorization: send the admin to Studio to grant access.
 app.get('/auth/login', (req, res) => {
   if (!tokens.config.CLIENT_ID || !tokens.config.CLIENT_SECRET) {
     return res.status(400).send('Set BLUEBEAM_CLIENT_ID and BLUEBEAM_CLIENT_SECRET before using /auth/login.');
   }
-  res.redirect(tokens.authorizeUrl(redirectUri(req)));
+  res.redirect(tokens.authorizeUrl(redirectUri(req), newState()));
 });
 
-// Studio redirects back here with ?code=... — exchange it for tokens (incl. the
-// long-lived refresh token, which is then cached + persisted).
+// Studio redirects back here with ?code=...&state=... — verify state, then
+// exchange the code for tokens (incl. the long-lived refresh token).
 app.get('/auth/callback', async (req, res) => {
   const code = req.query.code;
+  const state = req.query.state;
   if (!code) {
     const err = req.query.error_description || req.query.error || 'no code returned';
     return res.status(400).send('Authorization failed: ' + err);
+  }
+  if (!state || !consumeState(String(state))) {
+    return res.status(400).send('Authorization failed: state missing, expired, or not recognized. Start again at /auth/login (the server may have restarted between login and callback).');
   }
   try {
     await tokens.exchangeCode(String(code), redirectUri(req));
