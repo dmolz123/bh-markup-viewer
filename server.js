@@ -164,9 +164,14 @@ async function ensureSnapshot(sid, fid) {
   return { status: (r.json && r.json.Status) || 'Pending', downloadUrl: (r.json && r.json.DownloadUrl) || null };
 }
 
-function pickPdf(files) {
-  const arr = Array.isArray(files) ? files : (files && files.ProjectFiles) || [];
-  const list = Array.isArray(files) ? files : arr;
+// The Studio files endpoint returns SessionFilesDto = { Files: [...], TotalCount }.
+function filesArray(json) {
+  if (json && Array.isArray(json.Files)) return json.Files;      // SessionFilesDto
+  if (Array.isArray(json)) return json;                          // bare array (defensive)
+  if (json && Array.isArray(json.ProjectFiles)) return json.ProjectFiles;
+  return [];
+}
+function pickPdf(list) {
   const pdfs = list.filter((f) => /\.pdf$/i.test(f.Name || f.name || ''));
   return (pdfs[0] || list[0] || null);
 }
@@ -268,7 +273,7 @@ app.get('/api/sessions/:sid', async (req, res) => {
     bb('/publicapi/v1/sessions/' + encodeURIComponent(sid) + '/files'),
   ]);
   if (!sess.ok) return fail(res, sess, 'GET session');
-  res.json({ session: sess.json, files: files.ok ? files.json : [] });
+  res.json({ session: sess.json, files: filesArray(files.json) });
 });
 
 app.get('/api/sessions/:sid/files/:fid/markups', async (req, res) => {
@@ -291,7 +296,7 @@ app.get('/api/load/:sid', async (req, res) => {
   ]);
   if (!sess.ok) return fail(res, sess, 'GET session');
 
-  const fileList = Array.isArray(files.json) ? files.json : [];
+  const fileList = filesArray(files.json);
   const file = pickPdf(fileList);
   if (!file) {
     return res.json({ session: sess.json, files: fileList, file: null, markups: [], snapshot: null });
