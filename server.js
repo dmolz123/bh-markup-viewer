@@ -92,41 +92,30 @@ function fail(res, r, where) {
   res.status(r.status && r.status >= 400 ? r.status : 502).json({ error: hint, status: r.status, where, detail: r.json });
 }
 
-// ---- merge markups (list) + details (rect) by markupId ---------------------
+// ---- merge markups (list) + details (rect) by `name` -----------------------
+// The list DTO (SessionMarkupDto) carries markupId, pageNumber and name; the
+// detail DTO (SessionMarkupDetailDto) carries rect/contents but NO markupId and
+// NO pageNumber — its stable key is `name` (the markup GUID). So join on `name`.
 function mergeMarkups(list, details) {
-  const byId = new Map();
-  (Array.isArray(list) ? list : []).forEach((m) => {
-    byId.set(String(m.markupId), {
-      markupId: m.markupId,
-      pageNumber: m.pageNumber,
-      subject: m.subject || '',
-      status: m.status || '',
-      type: m.type || '',
-      author: m.displayName || m.email || '',
-      x: m.x, y: m.y,
-      documentWidth: m.documentWidth,
-      documentHeight: m.documentHeight,
-      contents: m.comments || '',
-      rect: null,
-    });
-  });
+  const detByName = new Map();
   (Array.isArray(details) ? details : []).forEach((d) => {
-    const key = String(d.markupId);
-    const cur = byId.get(key) || { markupId: d.markupId };
-    byId.set(key, {
-      ...cur,
-      pageNumber: cur.pageNumber != null ? cur.pageNumber : d.pageNumber,
-      subject: cur.subject || d.subject || '',
-      status: cur.status || d.status || '',
-      type: cur.type || d.type || '',
-      author: cur.author || d.author || '',
-      contents: d.contents || cur.contents || '',
-      rect: Array.isArray(d.rect) && d.rect.length === 4 ? d.rect : cur.rect || null,
-      width: d.width,
-    });
+    if (d && d.name != null) detByName.set(String(d.name), d);
   });
-  // only markups we can place (have a rect) come first; keep the rest too for the list
-  return Array.from(byId.values()).sort((a, b) => {
+  const out = (Array.isArray(list) ? list : []).map((m) => {
+    const d = m.name != null ? detByName.get(String(m.name)) : null;
+    return {
+      markupId: m.markupId,
+      name: m.name,
+      pageNumber: m.pageNumber,
+      subject: m.subject || (d && d.subject) || '',
+      status: m.status || '',
+      type: m.type || (d && d.type) || '',
+      author: m.displayName || m.email || (d && d.author) || '',
+      contents: (d && d.contents) || m.comments || '',
+      rect: d && Array.isArray(d.rect) && d.rect.length === 4 ? d.rect : null,
+    };
+  });
+  return out.sort((a, b) => {
     if ((a.pageNumber || 0) !== (b.pageNumber || 0)) return (a.pageNumber || 0) - (b.pageNumber || 0);
     return (a.markupId || 0) - (b.markupId || 0);
   });
@@ -303,21 +292,39 @@ app.get('/api/load/:sid', async (req, res) => {
   }
   const fid = file.Id != null ? file.Id : file.id;
 
-  const [mm, snap] = await Promise.all([
-    getMergedMarkups(sid, fid),
-    ensureSnapshot(sid, fid).catch(() => ({ status: 'Error', downloadUrl: null })),
-  ]);
+  // Only the markups are needed up front. The real page image comes from the PDF
+  // itself, rendered client-side with pdf.js from the proxied DownloadUrl — crisp
+  // and per-page, unlike the low-res single SnapshotDownloadUrl thumbnail.
+  const mm = await getMergedMarkups(sid, fid);
 
   res.json({
     session: sess.json,
     files: fileList,
     file: { id: fid, name: file.Name || file.name || '' },
     markups: mm.ok ? mm.markups : [],
-    snapshot: snap,
+    pdfUrl: '/api/sessions/' + encodeURIComponent(sid) + '/files/' + encodeURIComponent(fid) + '/pdf',
   });
 });
 
-// Optional image proxy (only needed if the snapshot DownloadUrl isn't publicly fetchable).
+// Stream the Session document PDF (via its DownloadUrl) so pdf.js can render it
+// same-origin. The DownloadUrl is a short-lived S3 link fetched per request.
+app.get('/api/sessions/:sid/files/:fid/pdf', async (req, res) => {
+  const r = await bb('/publicapi/v1/sessions/' + encodeURIComponent(req.params.sid) + '/files/' + encodeURIComponent(req.params.fid));
+  if (!r.ok) return fail(res, r, 'GET file detail');
+  const url = r.json && r.json.DownloadUrl;
+  if (!url) return res.status(404).json({ error: 'No DownloadUrl on this Session file.' });
+  try {
+    const up = await fetch(url);
+    if (!up.ok) return res.status(up.status).send('upstream ' + up.status);
+    res.set('Content-Type', up.headers.get('content-type') || 'application/pdf');
+    res.set('Cache-Control', 'private, max-age=120');
+    res.send(Buffer.from(await up.arrayBuffer()));
+  } catch (e) {
+    res.status(502).json({ error: 'PDF proxy error: ' + e.message });
+  }
+});
+
+// Optional image proxy (kept for the snapshot thumbnail if ever needed).
 app.get('/api/image', async (req, res) => {
   const url = req.query.url;
   if (!url || !/^https?:\/\//i.test(url)) return res.status(400).send('bad url');

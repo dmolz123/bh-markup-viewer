@@ -4,6 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>BH Markup Viewer — Bluebeam Studio</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <style>
   :root{
     --bg:#EEF2F7; --surface:#FFFFFF; --surface-2:#F4F7FB; --ink:#12202E; --text:#2C3A48;
@@ -39,8 +40,6 @@
   .sess input{font-family:var(--mono);font-size:12.5px;border:none;background:transparent;color:var(--ink);width:120px;outline:none}
   .badge-live{font-size:11px;font-weight:700;color:var(--accepted);background:var(--accepted-bg);border-radius:999px;padding:4px 11px;letter-spacing:.03em;display:inline-flex;align-items:center;gap:6px}
   .badge-live::before{content:"";width:7px;height:7px;border-radius:50%;background:var(--accepted)}
-  .badge-warn{color:var(--rejected);background:var(--rejected-bg)}
-  .badge-warn::before{background:var(--rejected)}
 
   .wrap{display:grid;grid-template-columns:340px minmax(0,1fr);gap:0;height:calc(100vh - 61px)}
   @media (max-width:820px){.wrap{grid-template-columns:1fr;height:auto}}
@@ -68,18 +67,20 @@
   .hint{font-size:12px;color:var(--muted);margin-left:auto}
 
   .stage{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:14px;box-shadow:var(--shadow);min-height:200px}
-  .sheet-wrap{position:relative;width:100%;background:var(--sheet);border:1px solid var(--sheet-line);border-radius:6px;overflow:hidden}
-  svg.sheet{display:block;width:100%;height:auto}
+  .sheet-wrap{position:relative;width:100%;background:var(--sheet);border:1px solid var(--sheet-line);border-radius:6px;overflow:hidden;min-height:120px}
+  .sheet-wrap canvas{display:block;width:100%;height:auto}
+  .sheet-wrap svg.overlay{position:absolute;inset:0;width:100%;height:100%}
   .cap{font-size:11.5px;color:var(--muted);margin-top:8px}
   .mk{cursor:pointer}
-  .mk rect.box{fill-opacity:.14;stroke-width:5;vector-effect:non-scaling-stroke;transition:fill-opacity .15s}
+  .mk rect.box{fill-opacity:.14;stroke-width:4;vector-effect:non-scaling-stroke;transition:fill-opacity .15s}
   .mk:hover rect.box{fill-opacity:.24}
-  .mk.sel rect.box{fill-opacity:.28;stroke-width:8}
+  .mk.sel rect.box{fill-opacity:.26;stroke-width:7}
   .mk .tag{font-family:var(--mono);font-weight:700}
   .mk.sel .halo{opacity:1}
   .halo{opacity:0;transition:opacity .15s}
   @media (prefers-reduced-motion:no-preference){.mk.sel rect.box{animation:pulse 1.6s ease-in-out infinite}}
-  @keyframes pulse{50%{fill-opacity:.16}}
+  @keyframes pulse{50%{fill-opacity:.14}}
+  .sheet-msg{padding:60px 20px;text-align:center;color:var(--sheet-ink);font-size:15px}
 
   .detail{margin-top:16px;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:0;box-shadow:var(--shadow);overflow:hidden}
   .detail .dh{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--line)}
@@ -114,7 +115,7 @@
     <div class="mark">BB</div>
     <div>
       <h1>BH Markup Viewer</h1>
-      <p>Live Bluebeam Studio Session markups, overlaid by <code>rect</code>, deep-linkable, open in Revu.</p>
+      <p>Live Bluebeam Studio Session markups, overlaid on the drawing by <code>rect</code>, deep-linkable, open in Revu.</p>
     </div>
   </div>
   <div class="spacer"></div>
@@ -152,7 +153,11 @@
 <div class="toast" id="toast"></div>
 
 <script>
-  // ---- status coloring (raw status text is shown verbatim; color is bucketed) ----
+  if (window.pdfjsLib) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  }
+
+  // status coloring (raw status text shown verbatim; color bucketed)
   var BUCKET={
     accepted:{c:"--accepted",bg:"--accepted-bg"}, rejected:{c:"--rejected",bg:"--rejected-bg"},
     open:{c:"--open",bg:"--open-bg"}, none:{c:"--none",bg:"--none-bg"}
@@ -162,63 +167,28 @@
     if(!s) return "none";
     if(/accept|approv|complete|resolved|done/.test(s)) return "accepted";
     if(/reject|cancel|void|closed/.test(s)) return "rejected";
+    if(/risk|identif|open|review|pending|flag/.test(s)) return "open";
     if(/none/.test(s)) return "none";
     return "open";
   }
   var cssv=function(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim();};
 
-  // ---- state ----
-  var STATE={ sid:"", file:null, session:null, markups:[], snapshot:null, page:null };
-  var selId=null;
-  var SNAPSHOT_PAGE=1; // the snapshot endpoint renders the document; treated as page 1 for overlay alignment
+  var STATE={ sid:"", file:null, session:null, markups:[], pdfUrl:null, page:null };
+  var pdfDoc=null, selId=null, renderSeq=0;
 
   function curSid(){return (document.getElementById('sid').value||'').trim();}
   function q(id){return document.getElementById(id);}
+  function esc(t){return String(t==null?"":t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
 
   function pagesWithMarkups(){
     var set={}; STATE.markups.forEach(function(m){ if(m.pageNumber!=null) set[m.pageNumber]=1; });
     var arr=Object.keys(set).map(Number).sort(function(a,b){return a-b;});
     return arr.length?arr:[1];
   }
-  function pageDims(page){
-    var m=STATE.markups.filter(function(x){return x.pageNumber===page && x.documentWidth && x.documentHeight;})[0];
-    if(m) return {w:m.documentWidth, h:m.documentHeight};
-    return {w:2448, h:1584};
-  }
-  // PDF rect [x1,y1,x2,y2] (bottom-left) -> top-left box for the SVG viewBox
-  function toBox(r,H){return {x:r[0], y:H-r[3], w:Math.abs(r[2]-r[0]), h:Math.abs(r[3]-r[1])};}
-
   function pageMarkups(){return STATE.markups.filter(function(m){return m.pageNumber===STATE.page;});}
 
-  function sheetSVG(){
-    var dim=pageDims(STATE.page), W=dim.w, H=dim.h;
-    var showImg = STATE.snapshot && STATE.snapshot.downloadUrl && STATE.page===SNAPSHOT_PAGE;
-    var s='<svg class="sheet" viewBox="0 0 '+W+' '+H+'" role="img" aria-label="Session document page '+STATE.page+'">';
-    if(showImg){
-      s+='<image href="'+esc(STATE.snapshot.downloadUrl)+'" x="0" y="0" width="'+W+'" height="'+H+'" preserveAspectRatio="xMidYMid slice"/>';
-    }else{
-      var L=cssv('--sheet-line');
-      s+='<rect x="0" y="0" width="'+W+'" height="'+H+'" fill="'+cssv('--sheet')+'"/>';
-      s+='<rect x="18" y="18" width="'+(W-36)+'" height="'+(H-36)+'" fill="none" stroke="'+L+'" stroke-width="4"/>';
-      s+='<text x="'+(W/2)+'" y="'+(H/2)+'" text-anchor="middle" font-family="'+cssv('--font').replace(/"/g,"")+'" font-size="'+(H*0.03)+'" fill="'+cssv('--sheet-ink')+'">Page '+STATE.page+' &#183; snapshot not shown for this page</text>';
-    }
-    pageMarkups().forEach(function(m){
-      if(!m.rect) return;
-      var b=toBox(m.rect,H), col=cssv(BUCKET[bucketOf(m.status)].c);
-      var chip=String(m.markupId).slice(-2);
-      s+='<g class="mk" data-id="'+m.markupId+'" tabindex="0" role="button" aria-label="Markup '+esc(m.subject||m.markupId)+'">';
-      s+='<rect class="halo" x="'+(b.x-10)+'" y="'+(b.y-10)+'" width="'+(b.w+20)+'" height="'+(b.h+20)+'" rx="10" fill="none" stroke="'+col+'" stroke-width="3" stroke-dasharray="6 6" vector-effect="non-scaling-stroke"/>';
-      s+='<rect class="box" x="'+b.x+'" y="'+b.y+'" width="'+b.w+'" height="'+b.h+'" rx="6" fill="'+col+'" stroke="'+col+'"/>';
-      s+='<circle cx="'+(b.x+2)+'" cy="'+(b.y+2)+'" r="26" fill="'+col+'"/>';
-      s+='<text class="tag" x="'+(b.x+2)+'" y="'+(b.y+11)+'" font-size="30" fill="#fff" text-anchor="middle">'+chip+'</text>';
-      s+='</g>';
-    });
-    s+='</svg>';
-    return s;
-  }
-
-  function esc(t){return String(t==null?"":t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
-  function pill(status){var b=BUCKET[bucketOf(status)];var label=status||"None";return '<span class="pill" style="color:'+cssv(b.c)+';background:'+cssv(b.bg)+'">'+esc(label)+'</span>';}
+  function pill(status){var b=BUCKET[bucketOf(status)];return '<span class="pill" style="color:'+cssv(b.c)+';background:'+cssv(b.bg)+'">'+esc(status||"None")+'</span>';}
+  function field(k,v,mono){return '<div class="field"><div class="k">'+k+'</div><div class="v'+(mono?' mono':'')+'">'+esc(v)+'</div></div>';}
 
   function renderList(){
     var el=q('list'); el.innerHTML='';
@@ -240,7 +210,7 @@
     var m=STATE.markups.filter(function(x){return x.markupId===selId;})[0];
     if(!m){el.hidden=true;return;}
     el.hidden=false;
-    var rectStr=m.rect?('['+m.rect.map(function(n){return Math.round(n);}).join(', ')+']'):'— (no geometry)';
+    var rectStr=m.rect?('['+m.rect.map(function(n){return Math.round(n);}).join(', ')+']'):'— (no geometry returned)';
     el.innerHTML=
       '<div class="dh"><span class="dot" style="background:'+cssv(BUCKET[bucketOf(m.status)].c)+';width:13px;height:13px;margin:0"></span>'+
         '<span class="subj">'+esc(m.subject||'(no subject)')+'</span>'+pill(m.status)+'</div>'+
@@ -263,38 +233,82 @@
       toast('Copied deep-link: &#8230;#/markup/'+m.markupId);
     };
   }
-  function field(k,v,mono){return '<div class="field"><div class="k">'+k+'</div><div class="v'+(mono?' mono':'')+'">'+esc(v)+'</div></div>';}
 
   function renderPageBar(){
     var pages=pagesWithMarkups();
     var sel=q('pageSel'); sel.innerHTML='';
     pages.forEach(function(p){ var o=document.createElement('option'); o.value=p; o.textContent=p; if(p===STATE.page)o.selected=true; sel.appendChild(o); });
-    var dim=pageDims(STATE.page);
-    q('pgdim').textContent=Math.round(dim.w)+' x '+Math.round(dim.h)+' pt';
     q('fname').textContent=STATE.file?STATE.file.name:'—';
-    var showImg = STATE.snapshot && STATE.snapshot.downloadUrl && STATE.page===SNAPSHOT_PAGE;
-    q('cap').textContent = showImg
-      ? 'Background: Session document snapshot (DownloadUrl). Boxes: markup rect from the API, Y-flipped into image space.'
-      : (STATE.snapshot && STATE.snapshot.downloadUrl
-          ? 'Snapshot renders page '+SNAPSHOT_PAGE+'; page '+STATE.page+' shown as a plain sheet with real markup positions.'
-          : 'No snapshot available; markups shown on a plain sheet at true positions ('+(STATE.snapshot?esc(STATE.snapshot.status||''):'')+').');
   }
 
-  function wireSheet(){
-    q('sheetWrap').innerHTML=sheetSVG();
-    Array.prototype.forEach.call(document.querySelectorAll('.mk'),function(g){
+  // Render the real PDF page with pdf.js, then overlay markup rects in point space.
+  async function renderPage(){
+    var seq=++renderSeq;
+    var wrap=q('sheetWrap');
+    renderPageBar();
+    if(!pdfDoc){
+      wrap.innerHTML='<div class="sheet-msg">'+(STATE.pdfUrl?'Rendering the document&#8230;':'No PDF available for this Session.')+'</div>';
+      q('pgdim').textContent=''; q('cap').textContent='';
+      return;
+    }
+    wrap.innerHTML='<div class="sheet-msg"><span class="spin"></span>Rendering page '+STATE.page+'&#8230;</div>';
+    var page;
+    try{ page=await pdfDoc.getPage(STATE.page); }
+    catch(e){ if(seq!==renderSeq)return; wrap.innerHTML='<div class="sheet-msg">Page '+STATE.page+' could not be rendered.</div>'; return; }
+    if(seq!==renderSeq) return;
+    var vp1=page.getViewport({scale:1});                 // point space (accounts for page rotation)
+    var Wpt=vp1.width, Hpt=vp1.height;
+    var scale=Math.max(1, Math.min(3, 2000/Wpt));        // crisp raster, capped
+    var vp=page.getViewport({scale:scale});
+    var canvas=document.createElement('canvas');
+    canvas.width=Math.round(vp.width); canvas.height=Math.round(vp.height);
+    var ctx=canvas.getContext('2d');
+    try{ await page.render({canvasContext:ctx, viewport:vp}).promise; }
+    catch(e){ if(seq!==renderSeq)return; wrap.innerHTML='<div class="sheet-msg">Render failed on page '+STATE.page+'.</div>'; return; }
+    if(seq!==renderSeq) return;
+
+    // overlay: viewBox in rendered viewport units; convert each rect's PDF points
+    // through the SAME viewport so rotation + origin flip are handled by pdf.js.
+    var svg='<svg class="overlay" viewBox="0 0 '+vp1.width+' '+vp1.height+'" preserveAspectRatio="none" role="img" aria-label="Markups on page '+STATE.page+'">';
+    pageMarkups().forEach(function(m){
+      if(!m.rect) return;
+      var a=vp1.convertToViewportPoint(m.rect[0], m.rect[1]);
+      var b=vp1.convertToViewportPoint(m.rect[2], m.rect[3]);
+      var x=Math.min(a[0],b[0]), y=Math.min(a[1],b[1]), w=Math.abs(b[0]-a[0]), h=Math.abs(b[1]-a[1]);
+      var pad=Math.max(6, Math.min(Wpt,Hpt)*0.006);      // small breathing room around tiny markups
+      x-=pad; y-=pad; w+=pad*2; h+=pad*2;
+      var col=cssv(BUCKET[bucketOf(m.status)].c);
+      var chip=String(m.markupId).slice(-2);
+      svg+='<g class="mk" data-id="'+m.markupId+'" tabindex="0" role="button" aria-label="Markup '+esc(m.subject||m.markupId)+'">';
+      svg+='<rect class="halo" x="'+(x-10)+'" y="'+(y-10)+'" width="'+(w+20)+'" height="'+(h+20)+'" rx="10" fill="none" stroke="'+col+'" stroke-width="3" stroke-dasharray="6 6" vector-effect="non-scaling-stroke"/>';
+      svg+='<rect class="box" x="'+x+'" y="'+y+'" width="'+w+'" height="'+h+'" rx="5" fill="'+col+'" stroke="'+col+'"/>';
+      var r=Math.max(13, Math.min(Wpt,Hpt)*0.014);
+      svg+='<circle cx="'+x+'" cy="'+y+'" r="'+r+'" fill="'+col+'"/>';
+      svg+='<text class="tag" x="'+x+'" y="'+(y+r*0.35)+'" font-size="'+(r*1.1)+'" fill="#fff" text-anchor="middle">'+chip+'</text>';
+      svg+='</g>';
+    });
+    svg+='</svg>';
+
+    wrap.innerHTML='';
+    wrap.appendChild(canvas);
+    wrap.insertAdjacentHTML('beforeend', svg);
+    Array.prototype.forEach.call(wrap.querySelectorAll('.mk'),function(g){
       g.addEventListener('click',function(){select(+g.dataset.id,true);});
       g.addEventListener('keydown',function(e){if(e.key==='Enter'||e.key===' '){e.preventDefault();select(+g.dataset.id,true);}});
+      if(+g.dataset.id===selId) g.classList.add('sel');
     });
+    var selNode=wrap.querySelector('.mk.sel'); if(selNode) selNode.parentNode.appendChild(selNode);
+
+    q('pgdim').textContent=Math.round(Wpt)+' x '+Math.round(Hpt)+' pt';
+    var withRect=pageMarkups().filter(function(m){return m.rect;}).length;
+    q('cap').textContent='Page rendered from the Session PDF. '+withRect+' of '+pageMarkups().length+' markup(s) on this page have geometry and are boxed (rect from the API, mapped through the page viewport).';
   }
 
-  function renderAll(){ renderPageBar(); renderList(); wireSheet(); renderDetail(); }
-
-  function select(id,updateHash){
+  async function select(id,updateHash){
     var m=STATE.markups.filter(function(x){return x.markupId===id;})[0];
     if(!m) return;
     selId=id;
-    if(m.pageNumber!=null && m.pageNumber!==STATE.page){ STATE.page=m.pageNumber; renderPageBar(); wireSheet(); }
+    if(m.pageNumber!=null && m.pageNumber!==STATE.page){ STATE.page=m.pageNumber; await renderPage(); }
     Array.prototype.forEach.call(document.querySelectorAll('.item'),function(n){n.classList.toggle('sel',+n.dataset.id===id);});
     Array.prototype.forEach.call(document.querySelectorAll('.mk'),function(n){n.classList.toggle('sel',+n.dataset.id===id);});
     var selNode=document.querySelector('.mk.sel'); if(selNode&&selNode.parentNode) selNode.parentNode.appendChild(selNode);
@@ -318,10 +332,10 @@
   async function loadSession(preferId){
     var sid=curSid();
     if(!sid){toast('Enter a Session ID');return;}
-    STATE.sid=sid; selId=null;
+    STATE.sid=sid; selId=null; pdfDoc=null;
     q('loadBtn').disabled=true;
     q('list').innerHTML='<div class="empty"><span class="spin"></span>Loading Session '+esc(sid)+'&#8230;</div>';
-    q('sheetWrap').innerHTML=''; q('detail').hidden=true; clearBanner();
+    q('sheetWrap').innerHTML=''; q('detail').hidden=true; q('pageSel').innerHTML=''; q('pgdim').textContent=''; q('cap').textContent=''; clearBanner();
     try{
       var res=await fetch('/api/load/'+encodeURIComponent(sid));
       var data=await res.json();
@@ -330,16 +344,24 @@
         q('list').innerHTML='<div class="empty">Could not load this Session.</div>';
         q('loadBtn').disabled=false; return;
       }
-      STATE.session=data.session; STATE.file=data.file; STATE.markups=data.markups||[]; STATE.snapshot=data.snapshot;
+      STATE.session=data.session; STATE.file=data.file; STATE.markups=data.markups||[]; STATE.pdfUrl=data.pdfUrl||null;
       q('liveBadge').hidden=false;
       if(!STATE.file){ banner('info','This Session has no PDF file to display.'); }
       else if(!STATE.markups.length){ banner('info','Connected. This Session document has no markups yet.'); }
       var pages=pagesWithMarkups();
-      STATE.page = pages.indexOf(SNAPSHOT_PAGE)>=0 ? SNAPSHOT_PAGE : pages[0];
-      renderAll();
-      var pick = (preferId && STATE.markups.some(function(x){return x.markupId===preferId;})) ? preferId
-               : (pageMarkups()[0] && pageMarkups()[0].markupId);
-      if(pick) select(pick, !preferId ? true : false);
+      STATE.page=pages[0];
+      renderList();
+
+      // load the PDF (best-effort); page render happens after
+      if(STATE.pdfUrl){
+        try{ pdfDoc=await pdfjsLib.getDocument({url:STATE.pdfUrl}).promise; }
+        catch(e){ pdfDoc=null; banner('info','Markups loaded, but the PDF could not be rendered (the document link may have expired). Boxes need the page image; try reloading.'); }
+      }
+      await renderPage();
+
+      var pick=(preferId && STATE.markups.some(function(x){return x.markupId===preferId;})) ? preferId
+             : (pageMarkups()[0] && pageMarkups()[0].markupId) || (STATE.markups[0] && STATE.markups[0].markupId);
+      if(pick) await select(pick, !preferId);
       toast('Loaded '+STATE.markups.length+' markup'+(STATE.markups.length===1?'':'s')+' from Session '+sid);
     }catch(e){
       banner('err','Network error talking to the viewer backend.');
@@ -358,10 +380,9 @@
   q('loadBtn').onclick=function(){ loadSession(); };
   q('sid').addEventListener('keydown',function(e){ if(e.key==='Enter'){ e.preventDefault(); loadSession(); } });
   q('openTop').onclick=openRevu;
-  q('pageSel').addEventListener('change',function(){ STATE.page=+this.value; wireSheet(); renderPageBar(); });
+  q('pageSel').addEventListener('change',function(){ STATE.page=+this.value; renderPage(); });
   window.addEventListener('hashchange',initFromHash);
 
-  // token sanity check + deep-link
   fetch('/api/health').then(function(r){return r.json();}).then(function(h){
     if(!h) return;
     var a=h.auth||{};
@@ -369,7 +390,7 @@
       if(a.hasClientCreds && !a.hasRefreshToken){
         banner('info','Not connected to Studio yet. <a href="/auth/login">Connect with Bluebeam</a> once, and the server will keep tokens fresh automatically.');
       }else{
-        banner('err','No Studio credentials on the server. Set <code>BLUEBEAM_CLIENT_ID</code>, <code>BLUEBEAM_CLIENT_SECRET</code> and a refresh token (or <code>BLUEBEAM_TOKEN</code>) in the Render environment.');
+        banner('err','No Studio credentials on the server. Set <code>BLUEBEAM_CLIENT_ID</code>, <code>BLUEBEAM_CLIENT_SECRET</code> and a refresh token (or <code>BLUEBEAM_TOKEN</code>) in the environment.');
       }
     }
   }).catch(function(){});
