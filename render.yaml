@@ -1,0 +1,14 @@
+# Render Blueprint (optional). You can also just create a Web Service in the
+# Render dashboard pointed at this repo and set the env vars there.
+services:
+  - type: web
+    name: bh-markup-viewer
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: BLUEBEAM_TOKEN
+        sync: false          # set the real value in the Render dashboard
+      - key: BLUEBEAM_API_BASE
+        value: https://api.bluebeam.com
