@@ -81,6 +81,13 @@
   @media (prefers-reduced-motion:no-preference){.mk.sel rect.box{animation:pulse 1.6s ease-in-out infinite}}
   @keyframes pulse{50%{fill-opacity:.14}}
   .sheet-msg{padding:60px 20px;text-align:center;color:var(--sheet-ink);font-size:15px}
+  .mklabels{position:absolute;inset:0;pointer-events:none;overflow:hidden}
+  .mkauthor{position:absolute;transform:translate(-50%,7px);white-space:nowrap;font:700 11px var(--font);color:#fff;padding:2px 9px;border-radius:999px;box-shadow:0 1px 3px rgba(0,0,0,.4);opacity:.9;max-width:42%;overflow:hidden;text-overflow:ellipsis}
+  .mkauthor.flip{transform:translate(-50%,calc(-100% - 7px))}
+  .mkauthor.sel{opacity:1;font-size:11.5px;padding:3px 11px;box-shadow:0 2px 6px rgba(0,0,0,.45)}
+  .mkcomment{position:absolute;transform:translateY(2px);background:var(--surface);color:var(--ink);border:1px solid var(--line-strong);border-left:4px solid var(--navy);border-radius:8px;padding:7px 10px;font:12.5px/1.35 var(--font);box-shadow:var(--shadow);min-width:150px;max-width:340px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:6;-webkit-box-orient:vertical}
+  .lbltoggle{font-size:12px;color:var(--muted);display:inline-flex;align-items:center;gap:5px;cursor:pointer;user-select:none}
+  .lbltoggle input{accent-color:var(--navy)}
 
   .detail{margin-top:16px;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:0;box-shadow:var(--shadow);overflow:hidden}
   .detail .dh{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--line)}
@@ -141,6 +148,7 @@
         <select id="pageSel" aria-label="Page"></select>
       </label>
       <span class="pg" id="pgdim"></span>
+      <label class="lbltoggle"><input type="checkbox" id="labelToggle" checked> Labels on drawing</label>
       <span class="hint">Click a markup box or a list item</span>
     </div>
     <div class="stage">
@@ -269,6 +277,7 @@
 
     // overlay: viewBox in rendered viewport units; convert each rect's PDF points
     // through the SAME viewport so rotation + origin flip are handled by pdf.js.
+    var boxes={};
     var svg='<svg class="overlay" viewBox="0 0 '+vp1.width+' '+vp1.height+'" preserveAspectRatio="none" role="img" aria-label="Markups on page '+STATE.page+'">';
     pageMarkups().forEach(function(m){
       if(!m.rect) return;
@@ -277,6 +286,7 @@
       var x=Math.min(a[0],b[0]), y=Math.min(a[1],b[1]), w=Math.abs(b[0]-a[0]), h=Math.abs(b[1]-a[1]);
       var pad=Math.max(6, Math.min(Wpt,Hpt)*0.006);      // small breathing room around tiny markups
       x-=pad; y-=pad; w+=pad*2; h+=pad*2;
+      boxes[m.markupId]={x:x,y:y,w:w,h:h};
       var col=cssv(BUCKET[bucketOf(m.status)].c);
       var chip=String(m.markupId).slice(-2);
       svg+='<g class="mk" data-id="'+m.markupId+'" tabindex="0" role="button" aria-label="Markup '+esc(m.subject||m.markupId)+'">';
@@ -292,16 +302,50 @@
     wrap.innerHTML='';
     wrap.appendChild(canvas);
     wrap.insertAdjacentHTML('beforeend', svg);
+    wrap.insertAdjacentHTML('beforeend', '<div class="mklabels"></div>');
+    STATE.vp={w:vp1.width, h:vp1.height}; STATE.boxes=boxes;
     Array.prototype.forEach.call(wrap.querySelectorAll('.mk'),function(g){
       g.addEventListener('click',function(){select(+g.dataset.id,true);});
       g.addEventListener('keydown',function(e){if(e.key==='Enter'||e.key===' '){e.preventDefault();select(+g.dataset.id,true);}});
       if(+g.dataset.id===selId) g.classList.add('sel');
     });
     var selNode=wrap.querySelector('.mk.sel'); if(selNode) selNode.parentNode.appendChild(selNode);
+    renderLabels();
 
     q('pgdim').textContent=Math.round(Wpt)+' x '+Math.round(Hpt)+' pt';
     var withRect=pageMarkups().filter(function(m){return m.rect;}).length;
     q('cap').textContent='Page rendered from the Session PDF. '+withRect+' of '+pageMarkups().length+' markup(s) on this page have geometry and are boxed (rect from the API, mapped through the page viewport).';
+  }
+
+  function labelsOn(){ var t=q('labelToggle'); return !t || t.checked; }
+
+  // Draw author + comment onto the drawing: an author pill under each box, and the
+  // selected markup's comment inside its box. Positioned by % of the page viewport
+  // so text stays readable (px) regardless of drawing scale.
+  function renderLabels(){
+    var wrap=q('sheetWrap'); var layer=wrap.querySelector('.mklabels');
+    if(!layer) return;
+    layer.innerHTML='';
+    if(!STATE.vp || !STATE.boxes || !labelsOn()) return;
+    var VW=STATE.vp.w, VH=STATE.vp.h;
+    pageMarkups().forEach(function(m){
+      var b=STATE.boxes[m.markupId]; if(!b) return;
+      var sel=(m.markupId===selId), col=cssv(BUCKET[bucketOf(m.status)].c);
+      var cx=(b.x+b.w/2)/VW*100, bottomPct=(b.y+b.h)/VH*100, topPct=b.y/VH*100, leftPct=b.x/VW*100, wPct=b.w/VW*100;
+      if(sel && m.contents){
+        var c=document.createElement('div'); c.className='mkcomment';
+        c.style.left=leftPct+'%'; c.style.top=topPct+'%'; c.style.width=wPct+'%'; c.style.borderLeftColor=col;
+        c.textContent=m.contents;
+        layer.appendChild(c);
+      }
+      if(m.author){
+        var flip=bottomPct>90;
+        var pill=document.createElement('div'); pill.className='mkauthor'+(flip?' flip':'')+(sel?' sel':'');
+        pill.style.left=cx+'%'; pill.style.top=(flip?topPct:bottomPct)+'%'; pill.style.background=col;
+        pill.textContent=m.author;
+        layer.appendChild(pill);
+      }
+    });
   }
 
   async function select(id,updateHash){
@@ -312,6 +356,7 @@
     Array.prototype.forEach.call(document.querySelectorAll('.item'),function(n){n.classList.toggle('sel',+n.dataset.id===id);});
     Array.prototype.forEach.call(document.querySelectorAll('.mk'),function(n){n.classList.toggle('sel',+n.dataset.id===id);});
     var selNode=document.querySelector('.mk.sel'); if(selNode&&selNode.parentNode) selNode.parentNode.appendChild(selNode);
+    renderLabels();
     renderDetail();
     if(updateHash){history.replaceState(null,'','#session/'+STATE.sid+'/markup/'+id);}
     var it=document.querySelector('.item.sel'); if(it) it.scrollIntoView({block:'nearest',behavior:'smooth'});
@@ -381,6 +426,7 @@
   q('sid').addEventListener('keydown',function(e){ if(e.key==='Enter'){ e.preventDefault(); loadSession(); } });
   q('openTop').onclick=openRevu;
   q('pageSel').addEventListener('change',function(){ STATE.page=+this.value; renderPage(); });
+  q('labelToggle').addEventListener('change', renderLabels);
   window.addEventListener('hashchange',initFromHash);
 
   fetch('/api/health').then(function(r){return r.json();}).then(function(h){
